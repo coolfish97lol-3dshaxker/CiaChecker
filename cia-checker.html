@@ -1,0 +1,1078 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Safe CIA Checker</title>
+
+<style>
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 20px;
+    background: #101114;
+    color: #eeeeee;
+    font-family: Arial, sans-serif;
+}
+
+.container {
+    width: 100%;
+    max-width: 750px;
+    margin: auto;
+    background: #1b1d22;
+    padding: 25px;
+    border-radius: 18px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.45);
+}
+
+h1 {
+    margin-top: 0;
+}
+
+p {
+    line-height: 1.5;
+}
+
+input[type="file"] {
+    width: 100%;
+    padding: 12px;
+    margin: 15px 0;
+    background: #111318;
+    color: white;
+    border-radius: 10px;
+    border: 1px solid #444;
+}
+
+button {
+    border: none;
+    border-radius: 10px;
+    padding: 12px 18px;
+    margin: 5px 5px 5px 0;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+button:disabled {
+    opacity: .4;
+    cursor: not-allowed;
+}
+
+#checkButton {
+    background: #3498db;
+    color: white;
+}
+
+#exportButton {
+    background: #2ecc71;
+    color: white;
+}
+
+#hashButton {
+    background: #9b59b6;
+    color: white;
+}
+
+#status {
+    margin-top: 20px;
+    padding: 18px;
+    background: #0e0f12;
+    border-radius: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: monospace;
+    line-height: 1.5;
+}
+
+.good {
+    color: #5cff7a;
+}
+
+.bad {
+    color: #ff6565;
+}
+
+.warn {
+    color: #ffd65c;
+}
+
+.info {
+    color: #62b8ff;
+}
+
+.progress {
+    width: 100%;
+    height: 10px;
+    margin-top: 18px;
+    background: #303238;
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+#progressBar {
+    width: 0%;
+    height: 100%;
+    background: #2ecc71;
+    transition: width .2s;
+}
+
+.small {
+    color: #aaa;
+    font-size: 13px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>🛠️ Safe CIA Checker</h1>
+
+<p>
+Select a Nintendo 3DS CIA file. Everything happens locally in your browser.
+The original CIA is never modified.
+</p>
+
+<p class="small">
+This tool does not attempt to rewrite encrypted or cryptographically
+signed CIA contents. If a CIA is genuinely corrupted, it will tell you
+instead of making a potentially worse file.
+</p>
+
+<input
+    id="fileInput"
+    type="file"
+    accept=".cia,application/octet-stream"
+>
+
+<br>
+
+<button id="checkButton" disabled>
+Check CIA
+</button>
+
+<button id="exportButton" disabled>
+Export Safe Copy
+</button>
+
+<button id="hashButton" disabled>
+SHA-256
+</button>
+
+<div class="progress">
+    <div id="progressBar"></div>
+</div>
+
+<div id="status">
+Waiting for a CIA...
+</div>
+
+</div>
+
+<script>
+
+"use strict";
+
+/*
+=========================================================
+SAFE CIA CHECKER
+=========================================================
+
+IMPORTANT:
+
+This program intentionally does NOT modify CIA internals.
+
+A CIA contains cryptographically protected information.
+Blindly changing:
+
+- TMD
+- Ticket
+- NCCH
+- content hashes
+- encrypted content
+- certificates
+
+can make a previously working CIA unusable.
+
+Therefore:
+
+CHECK = analyze
+
+EXPORT = byte-for-byte copy
+
+There is NO destructive repair routine.
+=========================================================
+*/
+
+
+let selectedFile = null;
+let selectedBuffer = null;
+let ciaInfo = null;
+
+
+/* ------------------------------------------------------
+   DOM
+------------------------------------------------------ */
+
+const fileInput = document.getElementById("fileInput");
+const checkButton = document.getElementById("checkButton");
+const exportButton = document.getElementById("exportButton");
+const hashButton = document.getElementById("hashButton");
+const statusBox = document.getElementById("status");
+const progressBar = document.getElementById("progressBar");
+
+
+/* ------------------------------------------------------
+   Utility functions
+------------------------------------------------------ */
+
+function setProgress(value) {
+
+    value = Math.max(0, Math.min(100, value));
+
+    progressBar.style.width = value + "%";
+}
+
+
+function align(value, alignment) {
+
+    return Math.ceil(value / alignment) * alignment;
+}
+
+
+function readU32(view, offset) {
+
+    return view.getUint32(offset, true);
+}
+
+
+function readU64(view, offset) {
+
+    const low = BigInt(view.getUint32(offset, true));
+
+    const high = BigInt(
+        view.getUint32(offset + 4, true)
+    );
+
+    return low | (high << 32n);
+}
+
+
+function hex(value) {
+
+    return "0x" +
+        value.toString(16).toUpperCase();
+}
+
+
+function formatBytes(bytes) {
+
+    if (typeof bytes === "bigint") {
+        bytes = Number(bytes);
+    }
+
+    if (bytes < 1024) {
+
+        return bytes + " B";
+    }
+
+    if (bytes < 1024 * 1024) {
+
+        return (
+            (bytes / 1024).toFixed(2) +
+            " KB"
+        );
+    }
+
+    if (bytes < 1024 * 1024 * 1024) {
+
+        return (
+            (bytes / 1024 / 1024).toFixed(2) +
+            " MB"
+        );
+    }
+
+    return (
+        (bytes / 1024 / 1024 / 1024).toFixed(2) +
+        " GB"
+    );
+}
+
+
+function escapeHTML(text) {
+
+    return String(text)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+
+/* ------------------------------------------------------
+   File selection
+------------------------------------------------------ */
+
+fileInput.addEventListener("change", function() {
+
+    selectedFile = fileInput.files[0];
+
+    selectedBuffer = null;
+    ciaInfo = null;
+
+    exportButton.disabled = true;
+    hashButton.disabled = true;
+
+    setProgress(0);
+
+    if (!selectedFile) {
+
+        checkButton.disabled = true;
+
+        statusBox.textContent =
+            "Waiting for a CIA...";
+
+        return;
+    }
+
+    checkButton.disabled = false;
+
+    statusBox.innerHTML =
+        '<span class="info">' +
+        "Loaded CIA" +
+        "</span>\n\n" +
+
+        "Filename: " +
+        escapeHTML(selectedFile.name) +
+        "\n" +
+
+        "Size: " +
+        formatBytes(selectedFile.size) +
+        "\n\n" +
+
+        "Press \"Check CIA\".";
+});
+
+
+/* ------------------------------------------------------
+   CIA analyzer
+------------------------------------------------------ */
+
+function analyzeCIA(buffer) {
+
+    const view = new DataView(buffer);
+
+    const fileSize = buffer.byteLength;
+
+    const result = {
+
+        valid: true,
+
+        problems: [],
+
+        warnings: [],
+
+        headerSize: null,
+
+        type: null,
+
+        version: null,
+
+        certSize: null,
+
+        ticketSize: null,
+
+        tmdSize: null,
+
+        metaSize: null,
+
+        contentSize: null,
+
+        certOffset: null,
+
+        ticketOffset: null,
+
+        tmdOffset: null,
+
+        contentOffset: null,
+
+        declaredEnd: null
+    };
+
+
+    /*
+    A CIA header is 0x20 bytes.
+    */
+
+    if (fileSize < 0x20) {
+
+        result.valid = false;
+
+        result.problems.push(
+            "File is smaller than a CIA header."
+        );
+
+        return result;
+    }
+
+
+    /*
+    CIA header fields.
+
+    0x00 = header size
+    0x04 = type
+    0x08 = version
+    0x0C = certificate chain size
+    0x10 = ticket size
+    0x14 = TMD size
+    0x18 = meta size
+    0x1C = content size
+    */
+
+    const headerSize =
+        readU32(view, 0x00);
+
+    const type =
+        readU32(view, 0x04);
+
+    const version =
+        readU32(view, 0x08);
+
+    const certSize =
+        readU32(view, 0x0C);
+
+    const ticketSize =
+        readU32(view, 0x10);
+
+    const tmdSize =
+        readU32(view, 0x14);
+
+    const metaSize =
+        readU32(view, 0x18);
+
+    const contentSize =
+        readU64(view, 0x1C);
+
+
+    result.headerSize = headerSize;
+    result.type = type;
+    result.version = version;
+
+    result.certSize = certSize;
+    result.ticketSize = ticketSize;
+    result.tmdSize = tmdSize;
+    result.metaSize = metaSize;
+    result.contentSize = contentSize;
+
+
+    /*
+    Header sanity.
+    */
+
+    if (headerSize !== 0x20) {
+
+        result.valid = false;
+
+        result.problems.push(
+            "CIA header size is not 0x20."
+        );
+    }
+
+
+    /*
+    Calculate section positions.
+
+    CIA sections are aligned to 0x40 bytes.
+    */
+
+    let offset = align(
+        headerSize,
+        0x40
+    );
+
+
+    result.certOffset = offset;
+
+    offset = align(
+        offset + certSize,
+        0x40
+    );
+
+
+    result.ticketOffset = offset;
+
+    offset = align(
+        offset + ticketSize,
+        0x40
+    );
+
+
+    result.tmdOffset = offset;
+
+    offset = align(
+        offset + tmdSize,
+        0x40
+    );
+
+
+    result.contentOffset = offset;
+
+
+    /*
+    Work with BigInt so huge values don't
+    lose precision.
+    */
+
+    const declaredEnd =
+        BigInt(result.contentOffset) +
+        contentSize +
+        BigInt(metaSize);
+
+
+    result.declaredEnd = declaredEnd;
+
+
+    /*
+    Check for impossible/truncated CIA.
+    */
+
+    if (declaredEnd > BigInt(fileSize)) {
+
+        result.valid = false;
+
+        result.problems.push(
+            "The CIA declares data beyond the end of the file."
+        );
+    }
+
+
+    /*
+    Extra bytes aren't necessarily corruption,
+    so this is only a warning.
+    */
+
+    if (declaredEnd < BigInt(fileSize)) {
+
+        result.warnings.push(
+            "The file contains extra bytes after the declared CIA data."
+        );
+    }
+
+
+    /*
+    Empty content is suspicious.
+    */
+
+    if (contentSize === 0n) {
+
+        result.valid = false;
+
+        result.problems.push(
+            "The CIA declares zero content bytes."
+        );
+    }
+
+
+    /*
+    Individual section sanity.
+    */
+
+    if (certSize > fileSize) {
+
+        result.valid = false;
+
+        result.problems.push(
+            "Certificate section is larger than the file."
+        );
+    }
+
+
+    if (ticketSize > fileSize) {
+
+        result.valid = false;
+
+        result.problems.push(
+            "Ticket section is larger than the file."
+        );
+    }
+
+
+    if (tmdSize > fileSize) {
+
+        result.valid = false;
+
+        result.problems.push(
+            "TMD section is larger than the file."
+        );
+    }
+
+
+    /*
+    Make sure calculated offsets aren't outside
+    the actual file.
+    */
+
+    if (result.contentOffset > fileSize) {
+
+        result.valid = false;
+
+        result.problems.push(
+            "Content section begins beyond the end of the file."
+        );
+    }
+
+
+    return result;
+}
+
+
+/* ------------------------------------------------------
+   Check button
+------------------------------------------------------ */
+
+checkButton.addEventListener("click", async function() {
+
+    if (!selectedFile) {
+        return;
+    }
+
+    try {
+
+        checkButton.disabled = true;
+
+        exportButton.disabled = true;
+
+        hashButton.disabled = true;
+
+        setProgress(10);
+
+        statusBox.textContent =
+            "Reading CIA...";
+
+
+        /*
+        Read the file without modifying it.
+        */
+
+        selectedBuffer =
+            await selectedFile.arrayBuffer();
+
+
+        setProgress(40);
+
+
+        /*
+        Analyze.
+        */
+
+        ciaInfo =
+            analyzeCIA(selectedBuffer);
+
+
+        setProgress(80);
+
+
+        displayResult(
+            ciaInfo,
+            selectedFile
+        );
+
+
+        /*
+        Only allow export if the structural
+        checks passed.
+        */
+
+        if (ciaInfo.valid) {
+
+            exportButton.disabled = false;
+        }
+
+
+        hashButton.disabled = false;
+
+        setProgress(100);
+
+    } catch (error) {
+
+        selectedBuffer = null;
+        ciaInfo = null;
+
+        exportButton.disabled = true;
+
+        hashButton.disabled = true;
+
+        setProgress(0);
+
+        statusBox.innerHTML =
+            '<span class="bad">' +
+            "❌ Unable to analyze CIA" +
+            "</span>\n\n" +
+
+            escapeHTML(error.message);
+    }
+
+    checkButton.disabled = false;
+});
+
+
+/* ------------------------------------------------------
+   Display result
+------------------------------------------------------ */
+
+function displayResult(info, file) {
+
+    let output = "";
+
+
+    if (info.valid) {
+
+        output +=
+            '<span class="good">' +
+            "✅ CIA STRUCTURE LOOKS VALID" +
+            "</span>\n\n";
+
+    } else {
+
+        output +=
+            '<span class="bad">' +
+            "❌ CIA STRUCTURE HAS A PROBLEM" +
+            "</span>\n\n";
+    }
+
+
+    output +=
+        "Filename: " +
+        escapeHTML(file.name) +
+        "\n\n";
+
+
+    output +=
+        "File size: " +
+        formatBytes(file.size) +
+        "\n\n";
+
+
+    output +=
+        "CIA header\n" +
+        "──────────\n" +
+
+        "Header size: " +
+        hex(info.headerSize) +
+        "\n" +
+
+        "Type: " +
+        hex(info.type) +
+        "\n" +
+
+        "Version: " +
+        info.version +
+        "\n\n";
+
+
+    output +=
+        "CIA sections\n" +
+        "────────────\n" +
+
+        "Certificate: " +
+        formatBytes(info.certSize) +
+        "\n" +
+
+        "Ticket:      " +
+        formatBytes(info.ticketSize) +
+        "\n" +
+
+        "TMD:         " +
+        formatBytes(info.tmdSize) +
+        "\n" +
+
+        "Content:     " +
+        formatBytes(info.contentSize) +
+        "\n" +
+
+        "Meta:        " +
+        formatBytes(info.metaSize) +
+        "\n\n";
+
+
+    output +=
+        "Offsets\n" +
+        "───────\n" +
+
+        "Certificate: " +
+        hex(info.certOffset) +
+        "\n" +
+
+        "Ticket:      " +
+        hex(info.ticketOffset) +
+        "\n" +
+
+        "TMD:         " +
+        hex(info.tmdOffset) +
+        "\n" +
+
+        "Content:     " +
+        hex(info.contentOffset) +
+        "\n\n";
+
+
+    if (info.problems.length > 0) {
+
+        output +=
+            '<span class="bad">' +
+            "PROBLEMS\n" +
+            "────────\n" +
+            "</span>";
+
+        for (const problem of info.problems) {
+
+            output +=
+                "• " +
+                escapeHTML(problem) +
+                "\n";
+        }
+
+        output += "\n";
+    }
+
+
+    if (info.warnings.length > 0) {
+
+        output +=
+            '<span class="warn">' +
+            "WARNINGS\n" +
+            "────────\n" +
+            "</span>";
+
+        for (const warning of info.warnings) {
+
+            output +=
+                "• " +
+                escapeHTML(warning) +
+                "\n";
+        }
+
+        output += "\n";
+    }
+
+
+    if (info.valid) {
+
+        output +=
+            '<span class="good">' +
+            "🟢 Safe export available.\n\n" +
+            "The export operation will NOT modify " +
+            "the CIA internals. It creates a " +
+            "byte-for-byte copy." +
+            "</span>";
+
+    } else {
+
+        output +=
+            '<span class="bad">' +
+            "🛑 Safe export disabled.\n\n" +
+            "This tool will not attempt to rewrite " +
+            "the damaged CIA. Obtain a known-good " +
+            "CIA instead." +
+            "</span>";
+    }
+
+
+    statusBox.innerHTML = output;
+}
+
+
+/* ------------------------------------------------------
+   SHA-256
+------------------------------------------------------ */
+
+hashButton.addEventListener("click", async function() {
+
+    if (!selectedBuffer) {
+
+        alert("Check a CIA first.");
+
+        return;
+    }
+
+
+    try {
+
+        hashButton.disabled = true;
+
+        statusBox.innerHTML +=
+            "\n\n<span class='info'>" +
+            "Calculating SHA-256..." +
+            "</span>";
+
+
+        const hashBuffer =
+            await crypto.subtle.digest(
+                "SHA-256",
+                selectedBuffer
+            );
+
+
+        const hashArray =
+            Array.from(
+                new Uint8Array(hashBuffer)
+            );
+
+
+        const hash =
+            hashArray
+                .map(
+                    byte =>
+                        byte
+                            .toString(16)
+                            .padStart(2, "0")
+                )
+                .join("");
+
+
+        statusBox.innerHTML +=
+            "\n\n" +
+            '<span class="info">' +
+            "SHA-256\n" +
+            "────────\n" +
+            hash +
+            "</span>";
+
+    } catch (error) {
+
+        alert(
+            "Could not calculate SHA-256: " +
+            error.message
+        );
+
+    } finally {
+
+        hashButton.disabled = false;
+    }
+});
+
+
+/* ------------------------------------------------------
+   Safe export
+------------------------------------------------------ */
+
+exportButton.addEventListener("click", function() {
+
+    /*
+    Safety checks.
+
+    Do not export if anything changed or if
+    validation didn't pass.
+    */
+
+    if (!selectedFile) {
+
+        alert("No CIA selected.");
+
+        return;
+    }
+
+
+    if (!selectedBuffer) {
+
+        alert("Check the CIA first.");
+
+        return;
+    }
+
+
+    if (!ciaInfo || !ciaInfo.valid) {
+
+        alert(
+            "Export is disabled because the CIA " +
+            "did not pass structural checks."
+        );
+
+        return;
+    }
+
+
+    /*
+    IMPORTANT:
+
+    We are using the original ArrayBuffer.
+
+    No CIA bytes are changed.
+    */
+
+    const blob =
+        new Blob(
+            [selectedBuffer],
+            {
+                type:
+                    "application/octet-stream"
+            }
+        );
+
+
+    const url =
+        URL.createObjectURL(blob);
+
+
+    const link =
+        document.createElement("a");
+
+
+    link.href = url;
+
+
+    /*
+    Make a safe filename.
+
+    This changes ONLY the filename,
+    NOT the CIA contents.
+    */
+
+    let base =
+        selectedFile.name
+            .replace(/\.cia$/i, "")
+            .replace(/[^\w\- ]+/g, "_");
+
+
+    link.download =
+        base +
+        "_checked.cia";
+
+
+    document.body.appendChild(link);
+
+
+    link.click();
+
+
+    link.remove();
+
+
+    setTimeout(
+        function() {
+
+            URL.revokeObjectURL(url);
+
+        },
+        1000
+    );
+
+
+    statusBox.innerHTML +=
+        "\n\n" +
+        '<span class="good">' +
+        "✅ Safe copy exported.\n\n" +
+        "The CIA contents were not rewritten." +
+        "</span>";
+});
+
+
+</script>
+
+</body>
+</html>
